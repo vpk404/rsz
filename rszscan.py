@@ -12,6 +12,8 @@ import hashlib
 import csv
 import argparse
 import json
+import shutil
+import subprocess
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -640,6 +642,19 @@ def analyze_for_lll(address: str, signatures: List[Dict[str, Any]]):
                 f.write(f"Reason: {', '.join(reason)}\n")
                 f.write(f"Signatures: {len(signatures)}\n")
                 f.write("-" * 40 + "\n")
+
+            # Trigger Sage if available
+            sage_path = shutil.which("sage")
+            if sage_path:
+                print(f"[LLL] Sage detected at {sage_path}. Launching attack module...")
+                try:
+                    subprocess.run([sage_path, "attack_lll.sage", filename], check=False)
+                except Exception as e:
+                    print(f"[!] Failed to run Sage: {e}")
+            else:
+                print(f"[INFO] SageMath not found. To run LLL attack manually:")
+                print(f"       sage attack_lll.sage {filename}")
+
         except Exception as e:
             print(f"[err] LLL export failed: {e}")
 
