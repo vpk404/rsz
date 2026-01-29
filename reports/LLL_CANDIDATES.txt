@@ -1,4 +1,0 @@
-Address: 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
-Reason: High signature count (177)
-Signatures: 177
-----------------------------------------

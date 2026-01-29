@@ -97,7 +97,7 @@ def solve_hnp(signatures, pubkey_hex):
         try:
             sinv = inverse_mod(s, n)
             t = (sinv * r) % n
-            u = (-sinv * z) % n
+            u = (sinv * z) % n
             ts.append(t)
             us.append(u)
         except ZeroDivisionError:
@@ -107,12 +107,15 @@ def solve_hnp(signatures, pubkey_hex):
     m = len(ts) # update m
 
     # Try different bias assumptions (bits of nonce size)
-    # Common leaks: 252 bits (4 bit bias), 248 bits (8 bit bias)
-    # 255 bits (1 bit bias) requires huge dimension
-    biases = [252, 248, 244]
+    # Common leaks:
+    # - 252 bits (4 bit bias): Common in old Android RNGs
+    # - 248 bits (8 bit bias): Common byte-alignment issues
+    # - 244 bits (12 bit bias): Stronger leakage
+    biases = [252, 248, 244, 240, 232, 224]
 
     for B in biases:
-        print(f"[*] Attempting bias B={B} bits...")
+        print(f"[*] Attempting Lattice Attack (Assumption: Nonce < 2^{B} bits)...")
+        print(f"    -> Estimated Bias: {256-B} bits")
 
         # Scaling factor K to balance the lattice
         # K * k_i approx K * 2^B
