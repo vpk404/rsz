@@ -208,6 +208,20 @@ def solve_hnp(signatures, pubkey_hex):
 
     return None
 
+def load_recovered_keys():
+    # Helper to check if we already have this key
+    recovered = set()
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            with open(OUTPUT_CSV, "r") as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                for row in reader:
+                    if row and len(row) > 0:
+                        recovered.add(row[0]) # Pubkey
+        except: pass
+    return recovered
+
 def process_file(filepath):
     print(f"\n[+] Loading {filepath}...")
     try:
@@ -229,7 +243,13 @@ def process_file(filepath):
         if pk:
             by_pub.setdefault(pk, []).append(s)
 
+    already_recovered = load_recovered_keys()
+
     for pub, sigs in by_pub.items():
+        if pub in already_recovered:
+            print(f"[-] Skipping {pub}: Already recovered.")
+            continue
+
         if len(sigs) < 10:
             print(f"[-] Skipping {pub}: Too few signatures ({len(sigs)}).")
             continue
